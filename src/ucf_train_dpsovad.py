@@ -33,38 +33,38 @@ def compute_mil_loss(anomaly_scores: torch.Tensor,
                      lengths: torch.Tensor,
                      device: torch.device) -> torch.Tensor:
     """
-    L_MIL: 多实例学习损失
+    L_MIL: Multiple Instance Learning Loss
 
-    使用Top-K方法获取视频级预测，动态调整k值
+    Uses Top-K method to obtain video-level predictions with dynamic k adjustment
 
-    公式：L_MIL = -E[(Y*log(y_video) + (1-Y)*log(1-y_video))]
-    其中：y_video = mean(top_k(A))
+    Formula: L_MIL = -E[(Y*log(y_video) + (1-Y)*log(1-y_video))]
+    where: y_video = mean(top_k(A))
 
     Args:
-        anomaly_scores: 异常分数 [B, T]
-        labels: 视频级标签 [B, C]
-        lengths: 实际序列长度 [B]
-        device: 计算设备
+        anomaly_scores: Anomaly scores [B, T]
+        labels: Video-level labels [B, C]
+        lengths: Actual sequence lengths [B]
+        device: Compute device
 
     Returns:
-        MIL损失标量
+        MIL loss scalar
     """
     instance_logits = torch.zeros(0, device=device)
-    labels_video = labels[:, 0]  # 视频级标签
+    labels_video = labels[:, 0]  # Video-level labels
 
     for i in range(anomaly_scores.shape[0]):
         length = int(lengths[i])
         k_val = dynamic_topk(length)
 
-        # Top-K选择
+        # Top-K selection
         tmp, _ = torch.topk(anomaly_scores[i, :length], k=k_val, largest=True)
         video_score = torch.mean(tmp).view(1)
         instance_logits = torch.cat([instance_logits, video_score], dim=0)
 
-    # 归一化到[0,1]
+    # Normalize to [0,1]
     instance_logits = torch.sigmoid(instance_logits)
 
-    # 二元交叉熵损失（0=normal, 1=anomaly）
+    # Binary cross entropy loss (0=normal, 1=anomaly)
     labels_video = (1 - labels_video).to(device)
     mil_loss = F.binary_cross_entropy(instance_logits, labels_video)
 
@@ -79,28 +79,28 @@ def compute_align_loss(logits_pos: torch.Tensor,
                       device: torch.device,
                       tau: float = 0.1) -> torch.Tensor:
     """
-    L_Align: 对齐损失
+    L_Align: Alignment Loss
 
-    确保视频特征与文本特征的对齐，使用Top-K伪标签生成帧级监督
+    Ensures alignment between video features and text features using Top-K pseudo labels for frame-level supervision
 
-    流程：
-    1. 计算对齐概率 P_i = Softmax([S_pos,i, S_neg,i] / tau)
-    2. 生成帧级伪标签：对于异常视频，Top-K片段标记为1，其余为0
-    3. 计算交叉熵惩罚预测概率与伪标签之间的差异
+    Process:
+    1. Calculate alignment probability P_i = Softmax([S_pos,i, S_neg,i] / tau)
+    2. Generate frame-level pseudo labels: For anomalous videos, mark Top-K segments as 1, others as 0
+    3. Calculate cross entropy to penalize difference between predicted probability and pseudo labels
 
-    公式：L_Align = -1/T* * sum_i sum_c y_c,i * log(P_c,i)
+    Formula: L_Align = -1/T* * sum_i sum_c y_c,i * log(P_c,i)
 
     Args:
-        logits_pos: 正样本相似度 [B, T, 1]
-        logits_neg: 负样本相似度 [B, T, 1]
-        anomaly_scores: 异常分数 [B, T]
-        labels: 视频级标签 [B, C]
-        lengths: 实际序列长度 [B]
-        device: 计算设备
-        tau: 温度系数
+        logits_pos: Positive sample similarity [B, T, 1]
+        logits_neg: Negative sample similarity [B, T, 1]
+        anomaly_scores: Anomaly scores [B, T]
+        labels: Video-level labels [B, C]
+        lengths: Actual sequence lengths [B]
+        device: Compute device
+        tau: Temperature coefficient
 
     Returns:
-        对齐损失标量
+        Alignment loss scalar
     """
     align_loss = torch.tensor(0.0, device=device)
 
@@ -108,24 +108,24 @@ def compute_align_loss(logits_pos: torch.Tensor,
         length = int(lengths[i])
         label = labels[i, 0]
 
-        # 计算对齐概率
+        # Calculate alignment probability
         logits_frame = torch.cat([logits_pos[i, :length], logits_neg[i, :length]], dim=-1)  # [T, 2]
         probs = F.softmax(logits_frame / tau, dim=-1)  # [T, 2]
 
-        # 生成伪标签
-        if label == 0:  # 异常视频
+        # Generate pseudo labels
+        if label == 0:  # Anomalous video
             k_val = dynamic_topk(length)
-            # 使用detach确保伪标签生成不参与梯度计算
+            # Use detach to ensure pseudo label generation does not participate in gradient computation
             _, top_indices = torch.topk(anomaly_scores[i, :length].detach(), k=k_val, largest=True)
             pseudo_labels = torch.zeros(length, 2, device=device)
-            pseudo_labels[:, 0] = 1.0  # 默认为正常
-            pseudo_labels[top_indices, 0] = 0.0  # Top-K标记为异常
+            pseudo_labels[:, 0] = 1.0  # Default as normal
+            pseudo_labels[top_indices, 0] = 0.0  # Mark Top-K as anomalous
             pseudo_labels[top_indices, 1] = 1.0
-        else:  # 正常视频
+        else:  # Normal video
             pseudo_labels = torch.zeros(length, 2, device=device)
-            pseudo_labels[:, 0] = 1.0  # 全部标记为正常
+            pseudo_labels[:, 0] = 1.0  # Mark all as normal
 
-        # 交叉熵
+        # Cross entropy
         frame_loss = -torch.sum(pseudo_labels * torch.log(probs + 1e-8)) / length
         align_loss += frame_loss
 
@@ -136,32 +136,32 @@ def compute_align_loss(logits_pos: torch.Tensor,
 def compute_smoothness_loss(anomaly_scores: torch.Tensor,
                            lengths: torch.Tensor) -> torch.Tensor:
     """
-    L_2: 时序平滑损失（向量化版本）
+    L_2: Temporal Smoothness Loss (Vectorized Version)
 
-    确保异常分数在时间维度上的平滑性和连贯性
-    使用欧几里得距离（L2范数）计算相邻帧之间的差异
+    Ensures smoothness and coherence of anomaly scores in the temporal dimension
+    Uses Euclidean distance (L2 norm) to calculate difference between adjacent frames
 
-    公式：L_2 = 1/(T*-1) * sum_{i=2}^{T*} |A_i - A_{i-1}|^2
+    Formula: L_2 = 1/(T*-1) * sum_{i=2}^{T*} |A_i - A_{i-1}|^2
 
     Args:
-        anomaly_scores: 异常分数 [B, T]
-        lengths: 实际序列长度 [B]
+        anomaly_scores: Anomaly scores [B, T]
+        lengths: Actual sequence lengths [B]
 
     Returns:
-        平滑损失标量
+        Smoothness loss scalar
     """
     B, T = anomaly_scores.shape
     device = anomaly_scores.device
 
-    # 构建有效帧mask
+    # Build valid frame mask
     idx = torch.arange(T, device=device).unsqueeze(0)
     valid = idx < lengths.unsqueeze(1)
 
-    # 计算相邻帧差异
+    # Calculate adjacent frame difference
     diff = anomaly_scores[:, 1:] - anomaly_scores[:, :-1]  # [B, T-1]
-    valid_pair = valid[:, 1:] & valid[:, :-1]  # 两帧都有效才计入
+    valid_pair = valid[:, 1:] & valid[:, :-1]  # Only count if both frames are valid
 
-    # 加权L2损失
+    # Weighted L2 loss
     diff2 = (diff ** 2) * valid_pair
     per_video = diff2.sum(dim=1) / (lengths - 1).clamp_min(1)
 
@@ -176,18 +176,18 @@ def train(model: nn.Module,
           label_map: dict,
           device: torch.device):
     """
-    DPSOVAD训练流程
+    DPSOVAD Training Process
 
-    损失函数：L_Total = L_MIL + λ_Align * L_Align + λ_2 * L_2
+    Loss Function: L_Total = L_MIL + λ_Align * L_Align + λ_2 * L_2
 
     Args:
-        model: DPSOVAD模型
-        normal_loader: 正常样本数据加载器
-        anomaly_loader: 异常样本数据加载器
-        testloader: 测试数据加载器
-        args: 训练配置
-        label_map: 类别映射
-        device: 计算设备
+        model: DPSOVAD model
+        normal_loader: Normal sample data loader
+        anomaly_loader: Anomalous sample data loader
+        testloader: Test data loader
+        args: Training configuration
+        label_map: Category mapping
+        device: Compute device
     """
     model.to(device)
 
@@ -279,7 +279,6 @@ def train(model: nn.Module,
                 # Test performance
                 AUC, AP = test(model, testloader, args.visual_length, prompt_text,
                               gt, gtsegments, gtlabels, device)
-                AP = AUC
 
                 # Save best model
                 if AP > ap_best:
