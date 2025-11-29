@@ -103,6 +103,58 @@ class Transformer(nn.Module):
         return self.resblocks(x)
 
 
+class CrossAttentionFusion(nn.Module):
+    """
+    Cross-Attention Fusion Module
+
+    This module uses multi-head cross-attention to let text prompt vectors (Query) adaptively retrieve visual frame sequences (Key/Value),
+    focusing on the key frames that best explain the current semantics, thus achieving robust cross-modal semantic alignment. Internally, it uses residual +
+    LayerNorm structure with Dropout, balancing training stability and generalization.
+
+    Args:
+        embed_dim (int): Feature dimension, default 512.
+        num_heads (int): Number of attention heads, default 8.
+        dropout (float): Dropout rate, default 0.1.
+    """
+
+    def __init__(self, embed_dim: int = 512, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,  # 直接处理 [B, L, D] 形式，避免额外转置
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        text_features: torch.Tensor,
+        visual_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Text-visual cross-attention fusion.
+
+        Args:
+            text_features (torch.Tensor): Text Query, shape [B, C, 512].
+            visual_features (torch.Tensor): Visual Key/Value, shape [B, T, 512].
+
+        Returns:
+            torch.Tensor: Aligned text features, shape [B, C, 512].
+        """
+        # Let text Query aggregate key frame information from visual Key/Value according to semantic needs
+        fused, _ = self.cross_attn(
+            query=text_features,
+            key=visual_features,
+            value=visual_features,
+            need_weights=False,
+        )  # fused: [B, C, 512]
+        fused = self.dropout(fused)
+        # Residual keeps original semantics, LayerNorm stabilizes training
+        return self.norm(text_features + fused)
+
+
 class DPSOVAD(nn.Module):
     """
     DPSOVAD model: Discriminative Prompt-based Video Anomaly Detection
@@ -120,8 +172,6 @@ class DPSOVAD(nn.Module):
                  visual_head: int,
                  visual_layers: int,
                  attn_window: int,
-                 prompt_prefix: int,
-                 prompt_postfix: int,
                  device):
         super().__init__()
 
@@ -130,8 +180,6 @@ class DPSOVAD(nn.Module):
         self.visual_width = visual_width
         self.embed_dim = embed_dim
         self.attn_window = attn_window
-        self.prompt_prefix = prompt_prefix
-        self.prompt_postfix = prompt_postfix
         self.device = device
 
         # Local module: Transformer with windowed attention
@@ -161,6 +209,7 @@ class DPSOVAD(nn.Module):
             ("gelu", QuickGELU()),
             ("c_proj", nn.Linear(visual_width * 4, visual_width))
         ]))
+        self.cross_fusion = CrossAttentionFusion(embed_dim=embed_dim, num_heads=8, dropout=0.1)
         self.mlp2 = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(visual_width, visual_width * 4)),
             ("gelu", QuickGELU()),
@@ -336,7 +385,7 @@ class DPSOVAD(nn.Module):
 
         # Construct padding mask if needed
         if lengths is not None and padding_mask is None:
-            max_T = images.shape[0]  # Time is first dim after permute
+            max_T = images.shape[0]  # Time is the first dim after permute
             idx = torch.arange(max_T, device=device).unsqueeze(1)
             padding_mask = idx >= lengths.unsqueeze(0)
             padding_mask = padding_mask.transpose(0, 1)  # [B, T]
@@ -421,7 +470,8 @@ class DPSOVAD(nn.Module):
         visual_features = self.encode_video(visual, padding_mask, lengths)  # [B, T, 512]
 
         # Encode text prompts
-        text_features_ori = self.encode_textprompt(text)  # [C, 512]
+        text_features_ori = self.encode_textprompt(text)  # [C, 512] = [4, 512]
+
 
         # Visual prompt fusion
         text_features = text_features_ori.unsqueeze(0).expand(visual_features.shape[0], -1, -1)  # [B, C, 512]
@@ -431,14 +481,21 @@ class DPSOVAD(nn.Module):
         visual_attn_norm = l2_normalize(visual_attn, dim=-1)
 
         # Fuse visual and text
-        text_features = text_features + visual_attn_norm.mean(dim=1, keepdim=True)
+        # Cross-attention: text Query retrieves visual Key/Value according to semantic needs, retaining frame-level temporal weights
+        text_features = self.cross_fusion(text_features, visual_attn_norm)  # [B, C, 512]
         text_features = text_features + self.mlp1(text_features)  # [B, C, 512]
 
         # Compute similarity
         visual_features_norm = l2_normalize(visual_features, dim=-1)  # [B, T, 512]
         text_features_norm = l2_normalize(text_features, dim=-1)  # [B, C, 512]
 
-        # [B, T, 512] @ [B, 512, C] = [B, T, C]
+
+        # Cache modal features for text-aware contrastive loss
+        self.visual_features = visual_features_norm
+        self.text_features = text_features_norm
+
+
+        # [B, T, 512] @ [B, 512, C] = [B, T, C] = [128, 512, 4]
         logits = visual_features_norm @ text_features_norm.permute(0, 2, 1) / 0.07
 
         # Split logits by number of positive and negative prompts

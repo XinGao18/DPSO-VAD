@@ -23,6 +23,8 @@ warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.functio
 # Suppress DPSOVAD text parameter deprecation warning (model always uses memory.txt fixed prompts)
 warnings.filterwarnings('ignore', message='.*DPSOVAD.encode_textprompt.*')
 
+
+
 def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels, device):
     """
     Test DPSOVAD model performance on UCF-Crime dataset
@@ -96,16 +98,19 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels, d
     # Merge anomaly scores from all videos
     ap_anomaly = torch.cat(ap_anomaly_list, dim=0).numpy()
 
-    # Compute AUC and AP
-    print("\n" + "="*60)
-    print("DPSOVAD Evaluation Results - UCF-Crime Test Set")
-    print("="*60)
-
     # Evaluate using anomaly scores
-    ROC_anomaly = roc_auc_score(gt, np.repeat(ap_anomaly, 16))
-    AP_anomaly = average_precision_score(gt, np.repeat(ap_anomaly, 16))
-    print(f"AUC: {ROC_anomaly:.4f}  |  AP: {AP_anomaly:.4f}")
-    print("="*60 + "\n")
+    if len(ap_anomaly) == 0:
+        raise ValueError("ap_anomaly is empty, cannot calculate evaluation metrics.")
+
+    # Dynamic frame-level upsampling with length alignment
+    seg_len = len(ap_anomaly)
+    gt_len = len(gt)
+
+    repeat_factor = int(np.round(gt_len / seg_len))
+    frame_scores = np.repeat(ap_anomaly, repeat_factor)
+
+    ROC_anomaly = roc_auc_score(gt, frame_scores)
+    AP_anomaly = average_precision_score(gt, frame_scores)
 
     return ROC_anomaly, AP_anomaly
 
@@ -159,8 +164,6 @@ if __name__ == '__main__':
         visual_head=args.visual_head,
         visual_layers=args.visual_layers,
         attn_window=args.attn_window,
-        prompt_prefix=args.prompt_prefix,
-        prompt_postfix=args.prompt_postfix,
         device=device
     )
 
@@ -172,6 +175,9 @@ if __name__ == '__main__':
 
     # Run test
     print("\nStarting test...")
-    auc, ap = test(model, testdataloader, args.visual_length, prompt_text, gt, gtsegments, gtlabels, device)
+    auc, ap = test(
+        model, testdataloader, args.visual_length, prompt_text,
+        gt, gtsegments, gtlabels, device
+    )
 
     print(f"\nFinal results: AUC={auc:.4f}, AP={ap:.4f}")

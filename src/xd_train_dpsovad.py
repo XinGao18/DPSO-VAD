@@ -20,7 +20,7 @@ import warnings
 from model_dpsovad import DPSOVAD, dynamic_topk
 from xd_test_dpsovad import test
 from utils.dataset import XDDataset
-from utils.tools import get_prompt_text, get_batch_label
+from utils.tools import get_prompt_text, get_batch_label, get_anomaly_flags
 import xd_option_dpsovad as xd_option
 
 # Suppress PyTorch attention mask type mismatch deprecation warning (PyTorch internal issue)
@@ -38,14 +38,14 @@ def compute_mil_loss(anomaly_scores: torch.Tensor,
 
     Uses Top-K method to obtain video-level predictions with dynamic k adjustment
 
-    Formula: L_MIL = -E[(Y*log(y_video) + (1-Y)*log(1-y_video))]
-    where: y_video = mean(top_k(A))
+    Formula:L_MIL = -E[(Y*log(y_video) + (1-Y)*log(1-y_video))]
+    where:y_video = mean(top_k(A))
 
     Args:
         anomaly_scores: Anomaly scores [B, T]
         labels: Video-level labels [B, C]
         lengths: Actual sequence lengths [B]
-        device: Compute device
+        device: Computing device
 
     Returns:
         MIL loss scalar
@@ -65,73 +65,11 @@ def compute_mil_loss(anomaly_scores: torch.Tensor,
     # Normalize to [0,1]
     instance_logits = torch.sigmoid(instance_logits)
 
-    # Binary cross entropy loss (0=normal, 1=anomaly)
+    # Binary cross-entropy loss (0=normal, 1=anomaly)
     labels_video = (1 - labels_video).to(device)
     mil_loss = F.binary_cross_entropy(instance_logits, labels_video)
 
     return mil_loss
-
-
-def compute_align_loss(logits_pos: torch.Tensor,
-                      logits_neg: torch.Tensor,
-                      anomaly_scores: torch.Tensor,
-                      labels: torch.Tensor,
-                      lengths: torch.Tensor,
-                      device: torch.device,
-                      tau: float = 0.1) -> torch.Tensor:
-    """
-    L_Align: Alignment Loss
-
-    Ensures alignment between video features and text features using Top-K pseudo labels for frame-level supervision
-
-    Process:
-    1. Calculate alignment probability P_i = Softmax([S_pos,i, S_neg,i] / tau)
-    2. Generate frame-level pseudo labels: For anomalous videos, mark Top-K segments as 1, others as 0
-    3. Calculate cross entropy to penalize difference between predicted probability and pseudo labels
-
-    Formula: L_Align = -1/T* * sum_i sum_c y_c,i * log(P_c,i)
-
-    Args:
-        logits_pos: Positive sample similarity [B, T, 1]
-        logits_neg: Negative sample similarity [B, T, 1]
-        anomaly_scores: Anomaly scores [B, T]
-        labels: Video-level labels [B, C]
-        lengths: Actual sequence lengths [B]
-        device: Compute device
-        tau: Temperature coefficient
-
-    Returns:
-        Alignment loss scalar
-    """
-    align_loss = torch.tensor(0.0, device=device)
-
-    for i in range(logits_pos.shape[0]):
-        length = int(lengths[i])
-        label = labels[i, 0]
-
-        # Calculate alignment probability
-        logits_frame = torch.cat([logits_pos[i, :length], logits_neg[i, :length]], dim=-1)  # [T, 2]
-        probs = F.softmax(logits_frame / tau, dim=-1)  # [T, 2]
-
-        # Generate pseudo labels
-        if label == 0:  # Anomalous video
-            k_val = dynamic_topk(length)
-            # Use detach to ensure pseudo label generation does not participate in gradient computation
-            _, top_indices = torch.topk(anomaly_scores[i, :length].detach(), k=k_val, largest=True)
-            pseudo_labels = torch.zeros(length, 2, device=device)
-            pseudo_labels[:, 0] = 1.0  # Default as normal
-            pseudo_labels[top_indices, 0] = 0.0  # Mark Top-K as anomalous
-            pseudo_labels[top_indices, 1] = 1.0
-        else:  # Normal video
-            pseudo_labels = torch.zeros(length, 2, device=device)
-            pseudo_labels[:, 0] = 1.0  # Mark all as normal
-
-        # Cross entropy
-        frame_loss = -torch.sum(pseudo_labels * torch.log(probs + 1e-8)) / length
-        align_loss += frame_loss
-
-    align_loss = align_loss / logits_pos.shape[0]
-    return align_loss
 
 
 def compute_smoothness_loss(anomaly_scores: torch.Tensor,
@@ -139,10 +77,10 @@ def compute_smoothness_loss(anomaly_scores: torch.Tensor,
     """
     L_2: Temporal Smoothness Loss (Vectorized Version)
 
-    Ensures smoothness and coherence of anomaly scores in the temporal dimension
-    Uses Euclidean distance (L2 norm) to calculate difference between adjacent frames
+    Ensures smoothness and coherence of anomaly scores across temporal dimension
+    Uses Euclidean distance (L2 norm) to compute differences between adjacent frames
 
-    Formula: L_2 = 1/(T*-1) * sum_{i=2}^{T*} |A_i - A_{i-1}|^2
+    Formula:L_2 = 1/(T*-1) * sum_{i=2}^{T*} |A_i - A_{i-1}|^2
 
     Args:
         anomaly_scores: Anomaly scores [B, T]
@@ -158,9 +96,9 @@ def compute_smoothness_loss(anomaly_scores: torch.Tensor,
     idx = torch.arange(T, device=device).unsqueeze(0)
     valid = idx < lengths.unsqueeze(1)
 
-    # Calculate adjacent frame difference
+    # Compute adjacent frame differences
     diff = anomaly_scores[:, 1:] - anomaly_scores[:, :-1]  # [B, T-1]
-    valid_pair = valid[:, 1:] & valid[:, :-1]  # Only count if both frames are valid
+    valid_pair = valid[:, 1:] & valid[:, :-1]  # Both frames must be valid
 
     # Weighted L2 loss
     diff2 = (diff ** 2) * valid_pair
@@ -168,6 +106,180 @@ def compute_smoothness_loss(anomaly_scores: torch.Tensor,
 
     return per_video.mean()
 
+
+def _build_valid_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+    """Build frame-level valid mask to avoid counting padding regions."""
+    idx = torch.arange(max_len, device=lengths.device).unsqueeze(0)
+    return idx < lengths.unsqueeze(1)
+
+
+def compute_feature_contrastive_loss(text_features: torch.Tensor,
+                                     visual_features: torch.Tensor,
+                                     labels: torch.Tensor,
+                                     lengths: torch.Tensor,
+                                     num_pos_prompts: int,
+                                     tau: float = 0.07,
+                                     eps: float = 1e-8) -> torch.Tensor:
+    """
+    L_feat = -log( exp(s_y / τ) / Σ_j exp(s_j / τ) )
+
+    Text-guided feature-level contrastive, utilizing positive/negative text prototypes to guide video representation separation.
+    """
+    if text_features.ndim != 3 or visual_features.ndim != 3:
+        raise ValueError("text_features and visual_features must be 3D tensors")
+
+    B, T, _ = visual_features.shape
+    valid_mask = _build_valid_mask(lengths, T).unsqueeze(-1)
+
+    pooled_visual = (visual_features * valid_mask).sum(dim=1)
+    pooled_visual = pooled_visual / lengths.clamp_min(1).unsqueeze(-1)
+    pooled_visual = F.normalize(pooled_visual, p=2, dim=-1, eps=eps)
+
+    text_features = F.normalize(text_features, p=2, dim=-1, eps=eps)
+    num_pos = max(1, min(num_pos_prompts, text_features.shape[1]))
+
+    text_pos_proto = text_features[:, :num_pos, :].mean(dim=1)
+    text_neg_proto = text_features[:, num_pos:, :].mean(dim=1) if text_features.shape[1] > num_pos else text_pos_proto.detach().clone()
+
+    text_pos_proto = F.normalize(text_pos_proto, p=2, dim=-1, eps=eps)
+    text_neg_proto = F.normalize(text_neg_proto, p=2, dim=-1, eps=eps)
+
+    prototypes = torch.stack([text_pos_proto, text_neg_proto], dim=1)
+    logits_proto = torch.bmm(prototypes, pooled_visual.unsqueeze(-1)).squeeze(-1) / tau
+
+    targets = get_anomaly_flags(labels).long().clamp(min=0, max=1)
+    return F.cross_entropy(logits_proto, targets)
+
+
+def compute_similarity_contrastive_loss(logits_pos: torch.Tensor,
+                                        logits_neg: torch.Tensor,
+                                        labels: torch.Tensor,
+                                        lengths: torch.Tensor,
+                                        margin: float = 0.2) -> torch.Tensor:
+    """
+    L_sim = E[ max(0, m + s_neg - s_pos) ] + E[ max(0, m + s_pos - s_neg) ]
+
+    Logits-based margin contrastive, encouraging Normal/Abnormal to separate in similarity space.
+    """
+    if logits_pos.shape != logits_neg.shape:
+        raise ValueError("logits_pos and logits_neg shapes must match")
+
+    B, T, _ = logits_pos.shape
+    valid_mask = _build_valid_mask(lengths, T)
+
+    logits_pos_valid = logits_pos.squeeze(-1).masked_fill(~valid_mask, float('-inf'))
+    logits_neg_valid = logits_neg.squeeze(-1).masked_fill(~valid_mask, float('-inf'))
+
+    max_pos = logits_pos_valid.max(dim=1).values
+    max_neg = logits_neg_valid.max(dim=1).values
+
+    inf_mask = torch.isinf(max_pos)
+    if inf_mask.any():
+        max_pos[inf_mask] = -10.0
+    inf_mask = torch.isinf(max_neg)
+    if inf_mask.any():
+        max_neg[inf_mask] = -10.0
+
+    max_pos = torch.clamp(max_pos, -10.0, 10.0)
+    max_neg = torch.clamp(max_neg, -10.0, 10.0)
+
+    video_labels = get_anomaly_flags(labels)
+    normal_loss = F.relu(margin + max_neg - max_pos)
+    abnormal_loss = F.relu(margin + max_pos - max_neg)
+
+    return ((1.0 - video_labels) * normal_loss + video_labels * abnormal_loss).mean()
+
+
+def compute_score_contrastive_loss(anomaly_scores: torch.Tensor,
+                                   labels: torch.Tensor,
+                                   lengths: torch.Tensor,
+                                   tau: float = 0.07,
+                                   eps: float = 1e-8) -> torch.Tensor:
+    """
+    L_score = -log( Σ_{p∈P(i)} exp(sim_{ip}/τ) / Σ_{a≠i} exp(sim_{ia}/τ) )
+
+    Video-level InfoNCE based on anomaly_scores.
+    """
+    if anomaly_scores.ndim != 2:
+        raise ValueError("anomaly_scores must be a 2D tensor")
+
+    B, T = anomaly_scores.shape
+    valid_mask = _build_valid_mask(lengths, T)
+
+    masked_scores = anomaly_scores * valid_mask
+    mean_scores = masked_scores.sum(dim=1) / lengths.clamp_min(1)
+    max_scores = anomaly_scores.masked_fill(~valid_mask, float('-inf')).max(dim=1).values
+    max_scores = torch.where(torch.isinf(max_scores), torch.zeros_like(max_scores), max_scores)
+
+    video_repr = torch.stack([mean_scores, max_scores], dim=1)
+    video_repr = F.normalize(video_repr, p=2, dim=1, eps=eps)
+
+    similarity = torch.matmul(video_repr, video_repr.T) / tau
+    similarity = similarity - similarity.max(dim=1, keepdim=True)[0].detach()
+
+    eye = torch.eye(B, device=anomaly_scores.device, dtype=torch.bool)
+    exp_sim = torch.exp(similarity) * (~eye)
+
+    video_labels = get_anomaly_flags(labels)
+    pos_mask = (video_labels.unsqueeze(0) == video_labels.unsqueeze(1)) & (~eye)
+
+    pos_sum = (exp_sim * pos_mask).sum(dim=1)
+    denom = exp_sim.sum(dim=1).clamp_min(eps)
+
+    valid_rows = pos_mask.sum(dim=1) > 0
+    losses = torch.zeros(B, device=anomaly_scores.device)
+    safe_pos = pos_sum.clamp_min(eps)
+    losses[valid_rows] = -torch.log(safe_pos[valid_rows] / denom[valid_rows])
+
+    if valid_rows.any():
+        return losses[valid_rows].mean()
+    return torch.tensor(0.0, device=anomaly_scores.device)
+
+
+def compute_text_aware_contrastive_loss(text_features: torch.Tensor,
+                                        logits_pos: torch.Tensor,
+                                        logits_neg: torch.Tensor,
+                                        anomaly_scores: torch.Tensor,
+                                        labels: torch.Tensor,
+                                        lengths: torch.Tensor,
+                                        model: nn.Module,
+                                        tau: float = 0.07,
+                                        alpha: float = 0.4,
+                                        beta: float = 0.3,
+                                        gamma: float = 0.3) -> torch.Tensor:
+    """
+    L_text-aware = α·L_feat + β·L_sim + γ·L_score
+    """
+    if text_features is None or getattr(model, "visual_features", None) is None:
+        raise ValueError("Forward propagation must be run first to cache modal features")
+
+    visual_features = model.visual_features
+    num_pos = len(getattr(model, "positive_prompts", [])) or 1
+
+    loss_feat = compute_feature_contrastive_loss(
+        text_features=text_features,
+        visual_features=visual_features,
+        labels=labels,
+        lengths=lengths,
+        num_pos_prompts=num_pos,
+        tau=tau
+    )
+
+    loss_sim = compute_similarity_contrastive_loss(
+        logits_pos=logits_pos,
+        logits_neg=logits_neg,
+        labels=labels,
+        lengths=lengths
+    )
+
+    loss_score = compute_score_contrastive_loss(
+        anomaly_scores=anomaly_scores,
+        labels=labels,
+        lengths=lengths,
+        tau=tau
+    )
+
+    return alpha * loss_feat + beta * loss_sim + gamma * loss_score
 
 def train(model: nn.Module,
           normal_loader: DataLoader,
@@ -177,18 +289,18 @@ def train(model: nn.Module,
           label_map: dict,
           device: torch.device):
     """
-    DPSOVAD Training Process
+    DPSOVAD Training Pipeline
 
-    Loss Function: L_Total = L_MIL + λ_Align * L_Align + λ_2 * L_2
+    Loss function:L_Total = L_MIL + λ_Align * L_Align + λ_2 * L_2
 
     Args:
         model: DPSOVAD model
         normal_loader: Normal sample data loader
-        anomaly_loader: Anomalous sample data loader
+        anomaly_loader: Anomaly sample data loader
         testloader: Test data loader
         args: Training configuration
         label_map: Category mapping
-        device: Compute device
+        device: Computing device
     """
     model.to(device)
 
@@ -222,8 +334,8 @@ def train(model: nn.Module,
     for e in range(epoch, args.max_epoch):
         model.train()
         loss_total_mil = 0
-        loss_total_align = 0
         loss_total_smooth = 0
+        loss_total_contrastive = 0
 
         normal_iter = iter(normal_loader)
         anomaly_iter = iter(anomaly_loader)
@@ -239,22 +351,34 @@ def train(model: nn.Module,
             text_labels = get_batch_label(text_labels, prompt_text, label_map).to(device)
 
             # Forward propagation
-            text_features, logits_pos, logits = model(
+            _, logits_pos, logits = model(
                 visual_features, None, prompt_text, feat_lengths
             )
 
             # Get anomaly_scores and logits_neg_max (stored in model attributes)
             anomaly_scores = model.anomaly_scores
             logits_neg_max = model.logits_neg_max
+            text_features_batch = getattr(model, "text_features", None)
 
-            # Compute three loss components
+            # Compute loss components
             loss_mil = compute_mil_loss(anomaly_scores, text_labels, feat_lengths, device)
-            loss_align = compute_align_loss(logits_pos, logits_neg_max, anomaly_scores,
-                                           text_labels, feat_lengths, device)
             loss_smooth = compute_smoothness_loss(anomaly_scores, feat_lengths)
+            loss_contrastive = compute_text_aware_contrastive_loss(
+                text_features=text_features_batch,
+                logits_pos=logits_pos,
+                logits_neg=logits_neg_max,
+                anomaly_scores=anomaly_scores,
+                labels=text_labels,
+                lengths=feat_lengths,
+                model=model
+            )
 
             # Total loss
-            loss_total = loss_mil + lambda_align * loss_align + lambda_2 * loss_smooth
+            loss_total = (
+                loss_mil +
+                lambda_align * loss_contrastive +
+                lambda_2 * loss_smooth
+            )
 
             # Backward propagation
             optimizer.zero_grad()
@@ -262,47 +386,75 @@ def train(model: nn.Module,
             optimizer.step()
 
             loss_total_mil += loss_mil.item()
-            loss_total_align += loss_align.item()
             loss_total_smooth += loss_smooth.item()
+            loss_total_contrastive += loss_contrastive.item()
 
-            # Periodic evaluation and saving
+            # Periodic loss logging
             step = i * normal_loader.batch_size * 2
             if step % args.log_interval == 0 and step != 0:
                 avg_mil = loss_total_mil / (i + 1)
-                avg_align = loss_total_align / (i + 1)
                 avg_smooth = loss_total_smooth / (i + 1)
+                avg_contrastive = loss_total_contrastive / (i + 1)
+                total_loss = (avg_mil +
+                              lambda_align * avg_contrastive +
+                              lambda_2 * avg_smooth)
 
                 print(f'Epoch {e+1} | Step {step} | '
                       f'L_MIL: {avg_mil:.4f} | '
-                      f'L_Align: {avg_align:.4f} | '
-                      f'L_2: {avg_smooth:.4f}')
-
-                # Test performance
-                AUC, AP = test(model, testloader, args.visual_length, prompt_text,
-                              gt, gtsegments, gtlabels, device)
-
-                # Save best model (using AP as primary metric)
-                if AP > ap_best:
-                    ap_best = AP
-                    checkpoint = {
-                        'epoch': e,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'ap': ap_best
-                    }
-                    torch.save(checkpoint, args.checkpoint_path)
-                    print(f'Best model saved with AP: {ap_best:.4f}')
+                      f'L_TxtCon: {avg_contrastive:.4f} | '
+                      f'L_2: {avg_smooth:.4f} | '
+                      f'Loss: {total_loss:.4f}')
 
         scheduler.step()
+
+        # Silent epoch evaluation (no AP/AUC output)
+        epoch_AUC, epoch_AP = test(
+            model, testloader, args.visual_length, prompt_text,
+            gt, gtsegments, gtlabels, device
+        )
+
+        # Silent best model saving
+        if epoch_AP > ap_best:
+            ap_best = epoch_AP
+            checkpoint = {
+                'epoch': e,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'ap': ap_best,
+                'auc': epoch_AUC
+            }
+            torch.save(checkpoint, args.checkpoint_path)
 
         # Save current model at the end of each epoch
         os.makedirs('../model', exist_ok=True)
         torch.save(model.state_dict(), '../model/model_dpsovad_xd_cur.pth')
 
-        # Load best checkpoint
+        # Load best checkpoint for next epoch
         if os.path.exists(args.checkpoint_path):
             checkpoint = torch.load(args.checkpoint_path, weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Final evaluation after all epochs
+    print("\n" + "="*80)
+    print("Training completed. Running final evaluation...")
+    print("="*80)
+
+    # Load best model for final evaluation
+    if os.path.exists(args.checkpoint_path):
+        checkpoint = torch.load(args.checkpoint_path, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Run final test
+    final_AUC, final_AP = test(
+        model, testloader, args.visual_length, prompt_text,
+        gt, gtsegments, gtlabels, device
+    )
+
+    print("\n" + "="*80)
+    print("FINAL RESULTS")
+    print("="*80)
+    print(f"AUC: {final_AUC:.4f}  |  AP: {final_AP:.4f}")
+    print("="*80 + "\n")
 
     # Save final best model
     if os.path.exists(args.checkpoint_path):
@@ -354,8 +506,6 @@ if __name__ == '__main__':
         visual_head=args.visual_head,
         visual_layers=args.visual_layers,
         attn_window=args.attn_window,
-        prompt_prefix=args.prompt_prefix,
-        prompt_postfix=args.prompt_postfix,
         device=device
     )
 

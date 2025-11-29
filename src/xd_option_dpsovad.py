@@ -16,7 +16,7 @@ parser = argparse.ArgumentParser(description='DPSOVAD - Discriminative Prompt-ba
 # ============================================
 # Random seed
 # ============================================
-parser.add_argument('--seed', default=234, type=int,
+parser.add_argument('--seed', default=2025, type=int,
                     help='Random seed for reproducibility')
 
 # ============================================
@@ -31,20 +31,14 @@ parser.add_argument('--visual-length', default=256, type=int,
 parser.add_argument('--visual-width', default=512, type=int,
                     help='Visual feature width')
 
-parser.add_argument('--visual-head', default=2, type=int,
+parser.add_argument('--visual-head', default=4, type=int,
                     help='Number of multi-head attention heads')
 
 parser.add_argument('--visual-layers', default=1, type=int,
                     help='Number of Transformer layers')
 
-parser.add_argument('--attn-window', default=64, type=int,
+parser.add_argument('--attn-window', default=32, type=int,
                     help='Local attention window size')
-
-parser.add_argument('--prompt-prefix', default=10, type=int,
-                    help='Number of prompt prefix tokens')
-
-parser.add_argument('--prompt-postfix', default=10, type=int,
-                    help='Number of prompt postfix tokens')
 
 parser.add_argument('--classes-num', default=7, type=int,
                     help='Number of classes in XD-Violence dataset (including Normal)')
@@ -73,7 +67,7 @@ parser.add_argument('--scheduler-milestones', default=[3, 6, 10], nargs='+', typ
 parser.add_argument('--lambda-align', default=0.9, type=float,
                     help='Alignment loss weight λ_Align')
 
-parser.add_argument('--lambda-2', default=0.09, type=float,
+parser.add_argument('--lambda-2', default=0.01, type=float,
                     help='Smoothness loss weight λ_2')
 
 # ============================================
@@ -111,9 +105,6 @@ parser.add_argument('--use-checkpoint', default=False, type=bool,
 # ============================================
 parser.add_argument('--top-k-base', default=16, type=int,
                     help='Top-K dynamic calculation base (k = max(1, T/base + 1))')
-
-parser.add_argument('--align-tau', default=0.1, type=float,
-                    help='Alignment loss temperature coefficient')
 
 parser.add_argument('--gcn-threshold', default=0.7, type=float,
                     help='GCN similarity graph threshold')
