@@ -123,7 +123,7 @@ class CrossAttentionFusion(nn.Module):
             embed_dim=embed_dim,
             num_heads=num_heads,
             dropout=dropout,
-            batch_first=True,  # 直接处理 [B, L, D] 形式，避免额外转置
+            batch_first=True,  
         )
         self.norm = nn.LayerNorm(embed_dim)
         self.dropout = nn.Dropout(dropout)

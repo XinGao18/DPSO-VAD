@@ -33,11 +33,18 @@ class UCFDataset(data.Dataset):
         return clip_feature, clip_label, clip_length
 
 class XDDataset(data.Dataset):
-    def __init__(self, clip_dim: int, file_path: str, test_mode: bool, label_map: dict):
+    def __init__(self, clip_dim: int, file_path: str, test_mode: bool, label_map: dict, normal: bool = False):
         self.df = pd.read_csv(file_path)
         self.clip_dim = clip_dim
         self.test_mode = test_mode
         self.label_map = label_map
+        self.normal = normal
+        if normal == True and test_mode == False:
+            self.df = self.df.loc[self.df['label'] == 'A']
+            self.df = self.df.reset_index()
+        elif test_mode == False:
+            self.df = self.df.loc[self.df['label'] != 'A']
+            self.df = self.df.reset_index()
         
     def __len__(self):
         return self.df.shape[0]

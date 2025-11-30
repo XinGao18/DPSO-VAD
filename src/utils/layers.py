@@ -163,19 +163,42 @@ class SimilarityAdj(Module):
                + str(self.out_features) + ')'
 
 class DistanceAdj(Module):
-
+    """
+    Adjacency matrix based on temporal distance
+    Uses city block distance (Manhattan distance) to compute temporal distance between frames
+    """
     def __init__(self):
         super(DistanceAdj, self).__init__()
         self.sigma = Parameter(FloatTensor(1))
         self.sigma.data.fill_(0.1)
 
-    def forward(self, batch_size, max_seqlen):
-        # To support batch operations
+    def forward(self, batch_size, max_seqlen, device=None, lengths=None):
+        """
+        Forward propagation
+        batch_size: batch size
+        max_seqlen: maximum sequence length
+        device: target device (auto-detected or specified)
+        lengths: actual length of each sample [batch_size], used to mask padding regions
+        """
+        # Dynamically infer device
+        if device is None:
+            device = self.sigma.device
+
+        # Compute distance matrix
         self.arith = np.arange(max_seqlen).reshape(-1, 1)
         dist = pdist(self.arith, metric='cityblock').astype(np.float32)
-        self.dist = torch.from_numpy(squareform(dist)).to('cuda')
+        self.dist = torch.from_numpy(squareform(dist)).to(device)
         self.dist = torch.exp(-self.dist / torch.exp(torch.tensor(1.)))
-        self.dist = torch.unsqueeze(self.dist, 0).repeat(batch_size, 1, 1).to('cuda')
+        self.dist = torch.unsqueeze(self.dist, 0).repeat(batch_size, 1, 1).to(device)
+
+        # If lengths are provided, mask the padding regions
+        if lengths is not None:
+            mask = torch.zeros(batch_size, max_seqlen, max_seqlen, device=device)
+            for i in range(batch_size):
+                length = lengths[i].item() if torch.is_tensor(lengths[i]) else lengths[i]
+                mask[i, :length, :length] = 1.0
+            self.dist = self.dist * mask
+
         return self.dist
     
 if __name__ == '__main__':
