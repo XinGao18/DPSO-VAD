@@ -1,0 +1,7 @@
+<Positive Prompts>
+People follow protocol without acknowledging station staff's presence. 
+People are seen waiting behind a barrier while observing something through safety lines typical for transit platforms.
+
+<Negative Prompts>
+In the same transit platform, a similarly dressed individual might step beyond the safety Line without acknowledging Station Staff's presence, creating a risk despite appearing routine at first glance.
+An individual dressed similarly might step past the safe line without acknowledging despite appearing routine at first glance, creating potential danger.
