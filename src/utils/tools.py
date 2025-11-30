@@ -36,6 +36,20 @@ def get_batch_label(texts, prompt_text, label_map: dict):
 
     return label_vectors
 
+def get_anomaly_flags(label_vectors: torch.Tensor) -> torch.Tensor:
+    """
+    Convert multi-hot label vectors into binary anomaly indicators.
+
+    Assumes column 0 corresponds to the Normal class.
+    Returns:
+        Tensor shaped [B] with 1 for anomaly samples and 0 for normal samples.
+    """
+    if label_vectors.ndim != 2 or label_vectors.shape[1] == 0:
+        raise ValueError("label_vectors must be a [B, C] tensor with Normal at column 0")
+
+    normal_flags = label_vectors[:, 0]
+    return (1.0 - normal_flags).to(label_vectors.device)
+
 def get_prompt_text(label_map: dict):
     prompt_text = []
     for v in label_map.values():
